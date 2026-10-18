@@ -1,74 +1,78 @@
-# main.py
-#
-# This is the main entry point for the Elasticsearch document management workflow.
-# It can run in two modes based on user input:
-# 1. Add mode:
-#    - Deletes and recreates the specified index
-#    - Reads documents from a file
-#    - Uses an LLM to generate titles and keywords for each document
-#    - Generates metadata (ID, creator, creation date)
-#    - Adds the documents to Elasticsearch
-# 2. Query mode:
-#    - Counts documents in the specified index
-#    - Performs a multi-field full-text search on title, keywords, and content
-# This script integrates functions from helper modules and the LLM client.
+"""Enrich local documents and search them with Elasticsearch full-text queries."""
 
-from elasticsearch import Elasticsearch
-from es import es_client, es_function
-from helpers import doc_helper, prompt
-from llm import llm_client
+import argparse
 import asyncio
+import json
+import sys
+
+import aiohttp
+from elasticsearch import ApiError, TransportError
+
+from config import ELASTICSEARCH_INDEX, OLLAMA_TIMEOUT, ROOT
+from es import es_function
+from helpers import doc_helper
+from llm import llm_client
 
 
-def main():
-    file = doc_helper.file_reader("data/documents_dup_part_1_part_1_short")
+def positive_int(value: str) -> int:
+    result = int(value)
+    if result < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return result
 
-    index_name = "news"
 
-    command = input("Add or Query?")
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    ingest = commands.add_parser("ingest", help="Enrich and upsert one document per line")
+    ingest.add_argument("--file", default=str(ROOT / "data/sample.txt"))
+    query = commands.add_parser("query", help="Search title, keywords and content")
+    query.add_argument("text", help="Full-text search query")
+    query.add_argument("--limit", type=positive_int, default=3)
+    count = commands.add_parser("count", help="Count indexed documents")
+    for command in (ingest, query, count):
+        command.add_argument("--index", default=ELASTICSEARCH_INDEX)
+    return parser
 
-    if command.casefold() == "add":
-        es_function.delete_index(index_name)
-        es_function.create_or_get_index(index_name)
 
-        for record in file:
-            filled_title_prompt = llm_client.fill_prompt(prompt.title_prompt, record)
-            title = asyncio.run(llm_client.call_llama(filled_title_prompt))
+async def ingest_documents(file_name: str, index_name: str) -> int:
+    documents = doc_helper.file_reader(file_name)
+    if not documents:
+        raise ValueError("The input file contains no documents.")
+    es_function.create_or_get_index(index_name)
+    timeout = aiohttp.ClientTimeout(total=OLLAMA_TIMEOUT)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for number, document in enumerate(documents, start=1):
+            metadata = await llm_client.extract_metadata(document, session)
+            es_function.add_document(
+                index_name, doc_helper.document_id(document),
+                doc_helper.generate_doc(document, **metadata, source=str(file_name)),
+            )
+            print(f"[{number}/{len(documents)}] {metadata['title']}", file=sys.stderr)
+    es_function.refresh_index(index_name)
+    return es_function.count_documents(index_name)
 
-            filled_keyword_prompt = llm_client.fill_prompt(prompt.keywords_prompt, record)
-            keywords = asyncio.run(llm_client.call_llama(filled_keyword_prompt))
 
-            doc_id = doc_helper.generate_rand_id()
-            created_by = doc_helper.generate_rand_name()
-            created_at = doc_helper.generate_rand_time(start_year=2024, start_month=1, start_day=1, end_year=2025,
-                                                       end_month=1, end_day=1)
+def run(args: argparse.Namespace):
+    if args.command == "ingest":
+        return {"index": args.index, "count": asyncio.run(ingest_documents(args.file, args.index))}
+    if args.command == "count":
+        return {"index": args.index, "count": es_function.count_documents(args.index)}
+    if not args.text.strip():
+        raise ValueError("The search query must not be blank.")
+    return es_function.query_document(args.index, args.text, args.limit)
 
-            doc = {
-                "title": title,
-                "keywords": keywords,
-                "content": record,
-                "created_by": created_by,
-                "created_at": created_at
-            }
 
-            es_function.add_document(index_name=index_name, doc_id=doc_id, doc_name=doc)
-
-    else:
-        # print("Query")
-        # to be done: extract keywords from query using llm and set the keywords as query
-        print(es_function.count_documents(index_name))
-        query_body = {
-            "query": {
-                "multi_match": {
-                    "query": "美国大火",
-                    "fields": ["title","keywords","content"]
-                    # "operator": "and"
-                    # "minimum_should_match": 2
-                }
-            }
-        }
-        print(es_function.query_document(index_name=index_name, query_body=query_body))
+def main() -> int:
+    args = build_parser().parse_args()
+    try:
+        result = run(args)
+    except (OSError, ValueError, RuntimeError, ApiError, TransportError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

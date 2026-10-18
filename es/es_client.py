@@ -1,14 +1,19 @@
-# es_client.py
-#
-# This file initializes an Elasticsearch client connection to a local server.
-# It uses an API key for authentication and sets a 60-second request timeout.
-# The `client` object can be imported and reused across the project for
-# performing Elasticsearch operations such as indexing, searching, and updating.
+"""Connect to a local or authenticated Elasticsearch 8.x cluster."""
+
+from functools import lru_cache
+from pathlib import Path
 
 from elasticsearch import Elasticsearch
 
-client = Elasticsearch(
-    "http://localhost:9200",
-    api_key="T2gxN1k1Z0IzYUZXM084bkR2dTE6RGx4bElGdE8wWEdWdUVURERfWUtrdw==",
-    request_timeout=60
-)
+from config import ELASTICSEARCH_API_KEY, ELASTICSEARCH_CA_CERTS, ELASTICSEARCH_URL, ROOT
+
+
+@lru_cache(maxsize=1)
+def get_client() -> Elasticsearch:
+    options = {"request_timeout": 60}
+    if ELASTICSEARCH_API_KEY:
+        options["api_key"] = ELASTICSEARCH_API_KEY
+    if ELASTICSEARCH_CA_CERTS:
+        certificate = Path(ELASTICSEARCH_CA_CERTS).expanduser()
+        options["ca_certs"] = str(certificate if certificate.is_absolute() else ROOT / certificate)
+    return Elasticsearch(ELASTICSEARCH_URL, **options)
